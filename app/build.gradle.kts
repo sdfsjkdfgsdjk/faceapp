@@ -30,7 +30,32 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    androidResources {
+        // Модель нейросети читается напрямую из APK — её нельзя сжимать
+        noCompress += "tflite"
+    }
 }
+
+// Нейросеть MediaPipe для поиска волос и лица (≈16 МБ) — скачивается при первой сборке
+val modelFile = file("src/main/assets/selfie_multiclass_256x256.tflite")
+val downloadModel by tasks.registering {
+    outputs.file(modelFile)
+    doLast {
+        if (!modelFile.exists() || modelFile.length() < 1000) {
+            modelFile.parentFile.mkdirs()
+            val url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/" +
+                "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
+            logger.lifecycle("Скачиваю модель: $url")
+            val part = File(modelFile.path + ".part")
+            java.net.URI(url).toURL().openStream().use { input ->
+                part.outputStream().use { input.copyTo(it) }
+            }
+            modelFile.delete()
+            check(part.renameTo(modelFile)) { "Не удалось сохранить модель" }
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(downloadModel) }
 
 dependencies {
     val cameraX = "1.4.2"
@@ -42,9 +67,10 @@ dependencies {
 
     implementation("androidx.camera:camera-camera2:$cameraX")
     implementation("androidx.camera:camera-lifecycle:$cameraX")
-    implementation("androidx.camera:camera-view:$cameraX")
-    implementation("androidx.camera:camera-mlkit-vision:$cameraX")
 
     // Модель распознавания лиц встроена в APK — работает без интернета
     implementation("com.google.mlkit:face-detection:16.1.7")
+
+    // Нейросеть сегментации волос/лица
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
 }

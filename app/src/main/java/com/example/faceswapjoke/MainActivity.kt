@@ -4,13 +4,13 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.Log
+import android.util.Size
 import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
@@ -22,15 +22,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.mlkit.vision.MlKitAnalyzer
-import androidx.camera.view.CameraController
-import androidx.camera.view.LifecycleCameraController
-import androidx.camera.view.PreviewView
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
@@ -39,32 +37,26 @@ import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), HeadSwapProcessor.Listener {
 
-    private lateinit var previewView: PreviewView
-    private lateinit var overlay: FaceOverlayView
+    private lateinit var screen: HeadSwapView
     private lateinit var hint: TextView
     private lateinit var thumb: ImageView
     private lateinit var flash: View
     private lateinit var btnLive: TextView
+    private lateinit var busyView: View
 
-    private var controller: LifecycleCameraController? = null
+    private lateinit var processor: HeadSwapProcessor
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var useFront = true
+
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val bgExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    /** Быстрый детектор для видео с камеры */
-    private val liveDetector: FaceDetector by lazy {
-        FaceDetection.getClient(
-            FaceDetectorOptions.Builder()
-                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
-                .setMinFaceSize(0.15f)
-                .build()
-        )
-    }
-
-    /** Точный детектор для выбранного фото */
+    /** Точный детектор и сегментатор — для подготовки «надеваемой» головы */
+    @Volatile private var photoDetectorCreated = false
     private val photoDetector: FaceDetector by lazy {
+        photoDetectorCreated = true
         FaceDetection.getClient(
             FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
@@ -72,8 +64,9 @@ class MainActivity : AppCompatActivity() {
                 .build()
         )
     }
+    private var photoSegmenter: Segmenter? = null
 
-    private var lastToneSample = 0L
+    private var faceVisible = false
     private var busy = false
 
     private val requestCamera =
@@ -92,16 +85,17 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        previewView = findViewById(R.id.previewView)
-        overlay = findViewById(R.id.overlay)
+        screen = findViewById(R.id.screen)
         hint = findViewById(R.id.hint)
         thumb = findViewById(R.id.thumb)
         thumb.clipToOutline = true
         flash = findViewById(R.id.flash)
         btnLive = findViewById(R.id.btnLive)
+        busyView = findViewById(R.id.busy)
 
-        // TextureView-режим: нужен, чтобы снимать кадр превью для фото
-        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        processor = HeadSwapProcessor(applicationContext)
+        processor.listener = this
+        btnLive.alpha = if (processor.liveEyes) 1f else 0.4f
 
         val controls = findViewById<View>(R.id.controls)
         ViewCompat.setOnApplyWindowInsetsListener(controls) { v, insets ->
@@ -113,16 +107,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<View>(R.id.btnGallery).setOnClickListener {
-            pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            if (!busy) pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         }
-        findViewById<View>(R.id.btnGrab).setOnClickListener { grabFaceFromFrame() }
-        findViewById<View>(R.id.btnShutter).setOnClickListener { takePhoto() }
+        findViewById<View>(R.id.btnGrab).setOnClickListener {
+            if (!faceVisible) toast(R.string.no_face_in_frame)
+            else if (!busy) processor.grabRequested = true
+        }
+        findViewById<View>(R.id.btnShutter).setOnClickListener {
+            processor.captureRequested = true
+            flash.alpha = 0.85f
+            flash.animate().alpha(0f).setDuration(250).start()
+        }
         findViewById<View>(R.id.btnFlip).setOnClickListener { flipCamera() }
         findViewById<View>(R.id.btnClear).setOnClickListener { setSource(null) }
         btnLive.setOnClickListener {
-            overlay.liveFeatures = !overlay.liveFeatures
-            btnLive.alpha = if (overlay.liveFeatures) 1f else 0.4f
-            toast(if (overlay.liveFeatures) R.string.live_on else R.string.live_off)
+            processor.liveEyes = !processor.liveEyes
+            btnLive.alpha = if (processor.liveEyes) 1f else 0.4f
+            toast(if (processor.liveEyes) R.string.live_on else R.string.live_off)
         }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
@@ -138,104 +139,135 @@ class MainActivity : AppCompatActivity() {
     // ---------- Камера ----------
 
     private fun startCamera() {
-        val c = LifecycleCameraController(this)
-        c.setEnabledUseCases(CameraController.IMAGE_ANALYSIS)
-        // MlKitAnalyzer сам переводит точки лица в координаты экрана (с учётом зеркала и поворота)
-        c.setImageAnalysisAnalyzer(
-            analysisExecutor,
-            MlKitAnalyzer(
-                listOf(liveDetector),
-                ImageAnalysis.COORDINATE_SYSTEM_VIEW_REFERENCED,
-                ContextCompat.getMainExecutor(this),
-            ) { result ->
-                onFaces(result.getValue(liveDetector))
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            cameraProvider = future.get()
+            bindCamera()
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun bindCamera() {
+        val provider = cameraProvider ?: return
+        var selector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        if (!provider.hasCamera(selector)) {
+            useFront = !useFront
+            selector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        }
+
+        val analysis = ImageAnalysis.Builder()
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1280, 720),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                        )
+                    )
+                    .build()
+            )
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+
+        val mirror = useFront
+        analysis.setAnalyzer(analysisExecutor) { image ->
+            try {
+                processor.process(image, mirror)
+            } catch (e: Exception) {
+                Log.e("HeadSwap", "Кадр пропущен", e)
+            } finally {
+                image.close()
             }
-        )
-        c.cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-        c.bindToLifecycle(this)
-        previewView.controller = c
-        controller = c
+        }
+
+        processor.reset()
+        provider.unbindAll()
+        try {
+            provider.bindToLifecycle(this, selector, analysis)
+        } catch (e: Exception) {
+            Log.e("HeadSwap", "Камера не запустилась", e)
+            toast(R.string.need_camera)
+        }
     }
 
     private fun flipCamera() {
-        val c = controller ?: return
-        val next = if (c.cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) {
-            CameraSelector.DEFAULT_BACK_CAMERA
-        } else {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        }
-        val available = try { c.hasCamera(next) } catch (e: IllegalStateException) { false }
-        if (available) {
-            overlay.setTarget(null)
-            c.cameraSelector = next
+        useFront = !useFront
+        bindCamera()
+    }
+
+    // ---------- Колбэки обработчика (фоновый поток) ----------
+
+    override fun onFrame(bitmap: Bitmap, faceFound: Boolean) {
+        runOnUiThread {
+            processor.shown = bitmap
+            screen.show(bitmap)
+            if (faceFound != faceVisible) {
+                faceVisible = faceFound
+                updateHint()
+            }
         }
     }
 
-    private fun onFaces(faces: List<Face>?) {
-        val shape = faces?.let { Faces.pickMain(it) }?.let { Faces.shapeOf(it) }
-        overlay.setTarget(shape)
-        updateHint()
-        if (shape != null) sampleSkinTone(shape)
+    override fun onGrab(frame: Bitmap) {
+        runOnUiThread { buildSource(frame, R.string.no_face_in_frame, R.string.face_taken) }
     }
 
-    /** Пару раз в секунду сравниваем цвет кожи в кадре и на фото */
-    private fun sampleSkinTone(target: FaceShape) {
-        val srcSkin = overlay.source?.skin ?: return
-        val now = SystemClock.uptimeMillis()
-        if (now - lastToneSample < 600) return
-        lastToneSample = now
-        val frame = previewView.bitmap ?: return
-        if (previewView.width == 0) return
-        val s = frame.width / previewView.width.toFloat()
-        val tgtSkin = Faces.meanSkinColor(frame, target, s)
-        frame.recycle()
-        if (tgtSkin == null) return
-        fun gain(i: Int): Float {
-            val ratio = (tgtSkin[i] + 1f) / (srcSkin[i] + 1f)
-            return (1f + (ratio - 1f) * 0.8f).coerceIn(0.6f, 1.6f)
+    override fun onCapture(photo: Bitmap) {
+        bgExecutor.execute {
+            val ok = saveToGallery(photo)
+            runOnUiThread { toast(if (ok) R.string.saved else R.string.save_failed) }
         }
-        overlay.setColorGains(gain(0), gain(1), gain(2))
     }
 
-    // ---------- Выбор лица ----------
+    // ---------- Выбор головы ----------
 
-    private fun setSource(src: FaceSource?) {
-        overlay.source = src
+    private fun setSource(src: HeadSource?) {
+        processor.source = src
         if (src == null) {
             thumb.visibility = View.GONE
             thumb.setImageDrawable(null)
         } else {
-            thumb.setImageBitmap(src.thumbnail())
+            thumb.setImageBitmap(src.thumbnail)
             thumb.visibility = View.VISIBLE
         }
-        lastToneSample = 0L
         updateHint()
     }
 
     private fun loadSourceFromUri(uri: Uri) {
         if (busy) return
-        busy = true
+        setBusy(true)
         bgExecutor.execute {
-            val bmp = try {
-                decodeScaled(uri, 1280)
-            } catch (e: Exception) {
+            val bmp = try { decodeScaled(uri, 1600) } catch (e: Exception) { null }
+            runOnUiThread {
+                setBusy(false)
+                if (bmp == null) toast(R.string.no_face_in_photo)
+                else buildSource(bmp, R.string.no_face_in_photo, null)
+            }
+        }
+    }
+
+    /** Вырезает голову в фоне: распознавание + нейросеть волос (1–2 секунды) */
+    private fun buildSource(bmp: Bitmap, failMsg: Int, okMsg: Int?) {
+        if (busy) return
+        setBusy(true)
+        bgExecutor.execute {
+            val src = try {
+                val seg = photoSegmenter ?: Segmenter.create(applicationContext, preferGpu = false)
+                    .also { photoSegmenter = it }
+                HeadSource.build(bmp, photoDetector, seg)
+            } catch (e: Throwable) {
+                Log.e("HeadSwap", "Не удалось вырезать голову", e)
                 null
             }
-            if (bmp == null) {
-                runOnUiThread { busy = false; toast(R.string.no_face_in_photo) }
-                return@execute
+            runOnUiThread {
+                setBusy(false)
+                if (src == null) toast(failMsg)
+                else {
+                    setSource(src)
+                    okMsg?.let { toast(it) }
+                }
             }
-            photoDetector.process(InputImage.fromBitmap(bmp, 0))
-                .addOnSuccessListener { faces ->
-                    busy = false
-                    val shape = Faces.pickMain(faces)?.let { Faces.shapeOf(it) }
-                    if (shape == null) toast(R.string.no_face_in_photo)
-                    else setSource(FaceSource(bmp, shape))
-                }
-                .addOnFailureListener {
-                    busy = false
-                    toast(R.string.no_face_in_photo)
-                }
         }
     }
 
@@ -254,48 +286,12 @@ class MainActivity : AppCompatActivity() {
         else bmp.copy(Bitmap.Config.ARGB_8888, false)
     }
 
-    /** Забрать лицо человека, который сейчас в кадре */
-    private fun grabFaceFromFrame() {
-        val shape = overlay.target
-        val frame = previewView.bitmap
-        if (shape == null || frame == null || previewView.width == 0) {
-            toast(R.string.no_face_in_frame)
-            return
-        }
-        val s = frame.width / previewView.width.toFloat()
-        val b = shape.bounds()
-        val pad = (b[2] - b[0]) * 0.25f
-        val l = ((b[0] - pad) * s).toInt().coerceIn(0, frame.width - 1)
-        val t = ((b[1] - pad) * s).toInt().coerceIn(0, frame.height - 1)
-        val r = ((b[2] + pad) * s).toInt().coerceIn(l + 1, frame.width)
-        val btm = ((b[3] + pad) * s).toInt().coerceIn(t + 1, frame.height)
-        val crop = Bitmap.createBitmap(frame, l, t, r - l, btm - t)
-            .copy(Bitmap.Config.ARGB_8888, false)
-        frame.recycle()
-        setSource(FaceSource(crop, shape.transformed(s, l.toFloat(), t.toFloat())))
-        toast(R.string.face_taken)
+    private fun setBusy(b: Boolean) {
+        busy = b
+        busyView.visibility = if (b) View.VISIBLE else View.GONE
     }
 
     // ---------- Фото ----------
-
-    private fun takePhoto() {
-        val frame = previewView.bitmap ?: return
-        if (overlay.width == 0) return
-        val out = frame.copy(Bitmap.Config.ARGB_8888, true)
-        frame.recycle()
-        val canvas = Canvas(out)
-        canvas.scale(out.width / overlay.width.toFloat(), out.height / overlay.height.toFloat())
-        overlay.draw(canvas)
-
-        flash.alpha = 0.85f
-        flash.animate().alpha(0f).setDuration(250).start()
-
-        bgExecutor.execute {
-            val ok = saveToGallery(out)
-            out.recycle()
-            runOnUiThread { toast(if (ok) R.string.saved else R.string.save_failed) }
-        }
-    }
 
     private fun saveToGallery(bmp: Bitmap): Boolean {
         val values = ContentValues().apply {
@@ -307,7 +303,7 @@ class MainActivity : AppCompatActivity() {
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: return false
         return try {
-            contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+            contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
                 ?: throw IllegalStateException("no stream")
             values.clear()
             values.put(MediaStore.Images.Media.IS_PENDING, 0)
@@ -323,8 +319,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateHint() {
         val text = when {
-            overlay.source == null -> getString(R.string.hint_pick)
-            overlay.target == null -> getString(R.string.hint_show_face)
+            processor.source == null -> getString(R.string.hint_pick)
+            !faceVisible -> getString(R.string.hint_show_face)
             else -> null
         }
         if (text == null) {
@@ -339,9 +335,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        cameraProvider?.unbindAll()
+        analysisExecutor.execute { processor.close() }
         analysisExecutor.shutdown()
+        bgExecutor.execute {
+            photoSegmenter?.close()
+            if (photoDetectorCreated) photoDetector.close()
+        }
         bgExecutor.shutdown()
-        liveDetector.close()
-        photoDetector.close()
     }
 }

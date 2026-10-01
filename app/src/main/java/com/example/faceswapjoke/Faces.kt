@@ -36,16 +36,13 @@ object Faces {
         return FaceShape(map, FaceContour.FACE)
     }
 
-    /**
-     * Средний цвет кожи: щёки и нос, без волос и фона.
-     * [scale] — перевод координат лица в координаты битмапа.
-     */
-    fun meanSkinColor(bmp: Bitmap, shape: FaceShape, scale: Float = 1f): FloatArray? {
+    /** Средний цвет кожи: щёки и нос, без волос и фона */
+    fun meanSkinColor(bmp: Bitmap, shape: FaceShape): FloatArray? {
         val b = shape.bounds()
-        val w = (b[2] - b[0]) * scale
-        val h = (b[3] - b[1]) * scale
-        val cx = shape.centerX() * scale
-        val cy = shape.centerY() * scale
+        val w = b[2] - b[0]
+        val h = b[3] - b[1]
+        val cx = shape.centerX()
+        val cy = shape.centerY()
         val x0 = cx - w * 0.28f; val x1 = cx + w * 0.28f
         val y0 = cy - h * 0.05f; val y1 = cy + h * 0.22f
 
@@ -61,20 +58,34 @@ object Faces {
         if (n < 20) return null
         return floatArrayOf((r / n).toFloat(), (g / n).toFloat(), (bl / n).toFloat())
     }
-}
 
-/** Лицо, которое «надеваем»: картинка + его контуры на ней */
-class FaceSource(val bitmap: Bitmap, val shape: FaceShape) {
-    val mesh = FaceMesh(shape)
-    val skin: FloatArray? = Faces.meanSkinColor(bitmap, shape)
-
-    fun thumbnail(): Bitmap {
-        val b = shape.bounds()
-        val pad = (b[2] - b[0]) * 0.1f
-        val l = (b[0] - pad).toInt().coerceIn(0, bitmap.width - 1)
-        val t = (b[1] - pad).toInt().coerceIn(0, bitmap.height - 1)
-        val r = (b[2] + pad).toInt().coerceIn(l + 1, bitmap.width)
-        val btm = (b[3] + pad).toInt().coerceIn(t + 1, bitmap.height)
-        return Bitmap.createBitmap(bitmap, l, t, r - l, btm - t)
+    /** Точка внутри многоугольника для всех пикселей прямоугольника — маска 0/1 */
+    fun polygonMask(poly: FloatArray, w: Int, h: Int, scale: Float): FloatArray {
+        val m = FloatArray(w * h)
+        val n = poly.size / 2
+        val xs = FloatArray(n) { poly[2 * it] * scale }
+        val ys = FloatArray(n) { poly[2 * it + 1] * scale }
+        val cross = FloatArray(n)
+        for (y in 0 until h) {
+            val py = y + 0.5f
+            var k = 0
+            var j = n - 1
+            for (i in 0 until n) {
+                if ((ys[i] > py) != (ys[j] > py)) {
+                    cross[k++] = (xs[j] - xs[i]) * (py - ys[i]) / (ys[j] - ys[i]) + xs[i]
+                }
+                j = i
+            }
+            if (k < 2) continue
+            java.util.Arrays.sort(cross, 0, k)
+            var p = 0
+            while (p + 1 < k) {
+                val from = maxOf(0, (cross[p] - 0.5f).toInt() + 1).coerceAtLeast(0)
+                val to = minOf(w - 1, (cross[p + 1] - 0.5f).toInt())
+                for (x in from..to) m[y * w + x] = 1f
+                p += 2
+            }
+        }
+        return m
     }
 }
