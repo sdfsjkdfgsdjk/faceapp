@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Чужое лицо</string>
+    <string name="hint_pick">Нажми 🖼 и выбери фото с лицом\nили 👤 — забрать лицо того, кто сейчас в кадре</string>
+    <string name="hint_show_face">Покажи лицо в камеру 🙂</string>
+    <string name="no_face_in_photo">На фото не нашлось лица. Попробуй другое — лицо анфас, крупно</string>
+    <string name="no_face_in_frame">В кадре нет лица — нечего забирать</string>
+    <string name="face_taken">Лицо забрано! Теперь наведи камеру на другого 😈</string>
+    <string name="saved">Фото сохранено в Галерею → Pictures/FaceSwapJoke</string>
+    <string name="save_failed">Не получилось сохранить фото</string>
+    <string name="need_camera">Без камеры шутка не получится — разреши доступ в настройках</string>
+    <string name="live_on">Живая мимика: твои глаза и рот поверх чужого лица</string>
+    <string name="live_off">Мимика выключена: лицо целиком с фото</string>
+</resources>
