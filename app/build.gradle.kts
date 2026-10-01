@@ -47,8 +47,8 @@ val downloadModel by tasks.registering {
                 "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
             logger.lifecycle("Скачиваю модель: $url")
             val part = File(modelFile.path + ".part")
-            java.net.URI(url).toURL().openStream().use { input ->
-                part.outputStream().use { input.copyTo(it) }
+               uri(url).toURL().openStream().use { input ->
+part.outputStream().use { input.copyTo(it) }
             }
             modelFile.delete()
             check(part.renameTo(modelFile)) { "Не удалось сохранить модель" }
